@@ -333,7 +333,7 @@ static void do_unpack(int argc, char **argv) {
         fclose(in);
         return;
     }
-    /* read entries */
+
     struct file_rec *recs = calloc(entry_count, sizeof(*recs));
     if (!recs) die("calloc failed");
     for (uint64_t i = 0; i < entry_count; ++i) {
@@ -351,19 +351,23 @@ static void do_unpack(int argc, char **argv) {
         recs[i].flags = flags;
     }
 
+    /* open manifest for writing */
+    char manifest_path[PATH_MAX];
+    if (snprintf(manifest_path, sizeof(manifest_path), "%s/.manifest", dest) >= (int)sizeof(manifest_path))
+        die("manifest path too long");
+    FILE *manifest = fopen(manifest_path, "w");
+    if (!manifest) die("fopen manifest '%s': %s", manifest_path, strerror(errno));
+
     /* extract */
     for (uint64_t i = 0; i < entry_count; ++i) {
-        /* seek to blob */
         if (fseek(in, (long)recs[i].offset, SEEK_SET) != 0) die("fseek failed");
         char outpath[PATH_MAX];
         if (snprintf(outpath, sizeof(outpath), "%s/%s", dest, recs[i].path) >= (int)sizeof(outpath))
             die("path too long for extraction");
 
-        /* create parent directories */
         ensure_parent_dirs(dest, recs[i].path);
 
         if (recs[i].flags & 0x1) {
-            /* symlink: read target and create symlink */
             char *buf = malloc(recs[i].size + 1);
             if (!buf) die("malloc");
             if (recs[i].size > 0) {
@@ -371,10 +375,10 @@ static void do_unpack(int argc, char **argv) {
             }
             buf[recs[i].size] = '\0';
             unlink(outpath);
-            if (symlink(buf, outpath) < 0) die("symlink '%s' -> '%s' failed: %s", outpath, buf, strerror(errno));
+            if (symlink(buf, outpath) < 0)
+                die("symlink '%s' -> '%s' failed: %s", outpath, buf, strerror(errno));
             free(buf);
         } else {
-            /* regular file: write content */
             FILE *out = fopen(outpath, "wb");
             if (!out) die("fopen '%s': %s", outpath, strerror(errno));
             uint64_t remaining = recs[i].size;
@@ -387,10 +391,17 @@ static void do_unpack(int argc, char **argv) {
             }
             if (fclose(out) != 0) die("fclose failed for '%s'", outpath);
         }
+
+        /* write relative path to manifest */
+        if (fprintf(manifest, "%s\n", recs[i].path) < 0)
+            die("write to manifest failed");
+
         printf("extracted: %s\n", outpath);
     }
 
-    /* cleanup */
+    if (fclose(manifest) != 0)
+        die("fclose manifest failed");
+
     for (uint64_t i = 0; i < entry_count; ++i) free(recs[i].path);
     free(recs);
     fclose(in);
