@@ -296,29 +296,158 @@ static void do_pack(int argc, char **argv) {
     printf("packed %zu entries into %s\n", g_rec_cnt, arcname);
 }
 
-/* extract helper: ensure directory exists for path */
-static void ensure_parent_dirs(const char *dest, const char *path) {
+/* ensure every parent directory for the given full path exists.
+ * full_path is the full destination path including filename (e.g. /tmp/out/dir/file)
+ */
+static void ensure_parent_dirs(const char *full_path) {
     char tmp[PATH_MAX];
-    if (snprintf(tmp, sizeof(tmp), "%s/%s", dest, path) >= (int)sizeof(tmp))
-        die("path too long");
-    /* strip trailing component and create directories */
-    char *p = tmp + strlen(dest) + 1;
-    for (; *p; ++p) {
+    if ((size_t)snprintf(tmp, sizeof(tmp), "%s", full_path) >= sizeof(tmp))
+        die("path too long in ensure_parent_dirs");
+
+    /* find parent directory */
+    char *last_slash = strrchr(tmp, '/');
+    if (!last_slash) return;            /* no parent component -> nothing to do */
+    if (last_slash == tmp) return;     /* parent is root "/" -> nothing to do */
+
+    *last_slash = '\0'; /* tmp now holds the parent directory */
+
+    /* create each intermediate component */
+    for (char *p = tmp + 1; *p; ++p) {
         if (*p == '/') {
             *p = '\0';
-            if (mkdir(tmp, 0755) < 0) {
-                if (errno != EEXIST) die("mkdir '%s': %s", tmp, strerror(errno));
-            }
+            if (mkdir(tmp, 0755) < 0 && errno != EEXIST)
+                die("mkdir '%s': %s", tmp, strerror(errno));
             *p = '/';
         }
     }
+    /* final parent */
+    if (mkdir(tmp, 0755) < 0 && errno != EEXIST)
+        die("mkdir '%s': %s", tmp, strerror(errno));
 }
 
-/* unpack command implementation */
+/* strip trailing slashes except keep single leading "/" */
+static void strip_trailing_slash(char *s) {
+    size_t n = strlen(s);
+    while (n > 1 && s[n-1] == '/') s[--n] = '\0';
+}
+
+/* ensure destination directory exists and is a directory */
+static void ensure_destdir(char *destbuf) {
+    strip_trailing_slash(destbuf);
+
+    struct stat st;
+    if (stat(destbuf, &st) < 0) {
+        if (errno == ENOENT) {
+            if (mkdir(destbuf, 0755) < 0 && errno != EEXIST)
+                die("mkdir '%s': %s", destbuf, strerror(errno));
+            return;
+        } else {
+            die("stat '%s': %s", destbuf, strerror(errno));
+        }
+    }
+    if (!S_ISDIR(st.st_mode)) die("destination '%s' exists and is not a directory", destbuf);
+}
+
+/* sanitize a stored archive relative path:
+ * - remove leading slashes and "./"
+ * - remove "." components
+ * - resolve ".." by popping previous component (reject if escapes above root)
+ * Returns malloc'd string or NULL if invalid/empty.
+ */
+static char *sanitize_relpath(const char *p)
+{
+    if (!p) return NULL;
+    const char *cur = p;
+    char comp[PATH_MAX];
+
+    /* components stored temporarily */
+    char *parts[PATH_MAX / 2];
+    size_t part_len[PATH_MAX / 2];
+    size_t nparts = 0;
+
+    /* skip leading slashes and a single leading "./" */
+    while (*cur == '/') cur++;
+    if (cur[0] == '.' && cur[1] == '/') cur += 2;
+    while (*cur == '/') cur++;
+
+    while (*cur) {
+        size_t i = 0;
+        while (*cur != '/' && *cur != '\0') {
+            if (i + 1 >= sizeof(comp)) { /* component too long */
+                for (size_t j = 0; j < nparts; ++j) free(parts[j]);
+                return NULL;
+            }
+            comp[i++] = *cur++;
+        }
+        comp[i] = '\0';
+        while (*cur == '/') cur++; /* collapse slashes */
+
+        if (i == 0) continue;
+        if (strcmp(comp, ".") == 0) continue;
+        if (strcmp(comp, "..") == 0) {
+            if (nparts == 0) {
+                /* escapes above archive root — reject */
+                for (size_t j = 0; j < nparts; ++j) free(parts[j]);
+                return NULL;
+            }
+            free(parts[--nparts]);
+            continue;
+        }
+        parts[nparts] = strdup(comp);
+        if (!parts[nparts]) {
+            for (size_t j = 0; j < nparts; ++j) free(parts[j]);
+            die("out of memory");
+        }
+        part_len[nparts] = i;
+        nparts++;
+        if (nparts >= (sizeof(parts)/sizeof(parts[0]))) {
+            for (size_t j = 0; j < nparts; ++j) free(parts[j]);
+            die("path too deep");
+        }
+    }
+
+    if (nparts == 0) {
+        /* nothing meaningful */
+        return NULL;
+    }
+
+    size_t tot = 0;
+    for (size_t i = 0; i < nparts; ++i) tot += part_len[i] + (i ? 1 : 0);
+    if (tot == 0 || tot >= PATH_MAX) {
+        for (size_t j = 0; j < nparts; ++j) free(parts[j]);
+        return NULL;
+    }
+
+    char *out = malloc(tot + 1);
+    if (!out) {
+        for (size_t j = 0; j < nparts; ++j) free(parts[j]);
+        die("out of memory");
+    }
+    char *w = out;
+    for (size_t i = 0; i < nparts; ++i) {
+        if (i) *w++ = '/';
+        memcpy(w, parts[i], part_len[i]);
+        w += part_len[i];
+        free(parts[i]);
+    }
+    *w = '\0';
+    return out;
+}
+
+/* unpack: read table, compute blob_start, then stream blobs sequentially */
 static void do_unpack(int argc, char **argv) {
     if (argc < 2) die("unpack requires: unpack <archive.pnd> [destdir]");
     const char *arcname = argv[1];
-    const char *dest = (argc >= 3) ? argv[2] : ".";
+
+    char destbuf[PATH_MAX];
+    if (argc >= 3) {
+        strncpy(destbuf, argv[2], sizeof(destbuf)-1);
+        destbuf[sizeof(destbuf)-1] = '\0';
+    } else {
+        strcpy(destbuf, ".");
+    }
+    ensure_destdir(destbuf);
+    const char *dest = destbuf;
 
     FILE *in = fopen(arcname, "rb");
     if (!in) die("fopen '%s' for read: %s", arcname, strerror(errno));
@@ -334,44 +463,95 @@ static void do_unpack(int argc, char **argv) {
         return;
     }
 
+    /* read table entries into recs[], but also compute table_size so we can find blob_start */
+    uint64_t table_size = 0;
     struct file_rec *recs = calloc(entry_count, sizeof(*recs));
     if (!recs) die("calloc failed");
+
     for (uint64_t i = 0; i < entry_count; ++i) {
         uint32_t path_len = read_u32_le(in);
         uint64_t size = read_u64_le(in);
-        uint64_t offset = read_u64_le(in);
+        uint64_t offset = read_u64_le(in); /* read but ignore later */
         uint32_t flags = read_u32_le(in);
-        char *path = malloc(path_len + 1);
-        if (!path) die("malloc");
-        if (fread(path,1,path_len,in) != path_len) die("read path failed");
-        path[path_len] = '\0';
-        recs[i].path = path;
+
+        table_size += ENTRY_HDR_SIZE + (uint64_t)path_len;
+
+        if (path_len == 0) {
+            recs[i].path = NULL;
+            recs[i].size = size;
+            recs[i].offset = offset;
+            recs[i].flags = flags;
+            continue;
+        }
+
+        char *raw = malloc(path_len + 1);
+        if (!raw) die("malloc");
+        if (fread(raw, 1, path_len, in) != path_len) die("read path failed");
+        raw[path_len] = '\0';
+
+        char *san = sanitize_relpath(raw);
+        free(raw);
+
+        if (!san) {
+            recs[i].path = NULL;
+        } else {
+            recs[i].path = san;
+        }
         recs[i].size = size;
         recs[i].offset = offset;
         recs[i].flags = flags;
     }
 
-    /* open manifest for writing */
+    /* compute blob_start (should match pack) */
+    uint64_t header_size = MAGIC_LEN + 8; /* magic + entry_count */
+    uint64_t blob_start = header_size + table_size;
+
+    /* open manifest safely */
     char manifest_path[PATH_MAX];
-    if (snprintf(manifest_path, sizeof(manifest_path), "%s/.manifest", dest) >= (int)sizeof(manifest_path))
-        die("manifest path too long");
+    if (strcmp(dest, "/") == 0) {
+        if (snprintf(manifest_path, sizeof(manifest_path), "/.manifest") >= (int)sizeof(manifest_path))
+            die("manifest path too long");
+    } else {
+        if (snprintf(manifest_path, sizeof(manifest_path), "%s/.manifest", dest) >= (int)sizeof(manifest_path))
+            die("manifest path too long");
+    }
     FILE *manifest = fopen(manifest_path, "w");
     if (!manifest) die("fopen manifest '%s': %s", manifest_path, strerror(errno));
 
-    /* extract */
-    for (uint64_t i = 0; i < entry_count; ++i) {
-        if (fseek(in, (long)recs[i].offset, SEEK_SET) != 0) die("fseek failed");
-        char outpath[PATH_MAX];
-        if (snprintf(outpath, sizeof(outpath), "%s/%s", dest, recs[i].path) >= (int)sizeof(outpath))
-            die("path too long for extraction");
+    /* seek to blob_start and read blobs sequentially in table order */
+    if (fseeko(in, (off_t)blob_start, SEEK_SET) != 0) die("fseeko failed to blob_start: %s", strerror(errno));
 
-        ensure_parent_dirs(dest, recs[i].path);
+    for (uint64_t i = 0; i < entry_count; ++i) {
+        if (!recs[i].path) {
+            fprintf(stderr, "warning: skipping empty or invalid archive entry at index %" PRIu64 "\n", i);
+            /* still must advance file pointer by recs[i].size to keep stream aligned */
+            if (recs[i].size > 0) {
+                if (fseeko(in, (off_t)recs[i].size, SEEK_CUR) != 0)
+                    die("fseeko failed skipping blob: %s", strerror(errno));
+            }
+            continue;
+        }
+
+        char outpath[PATH_MAX];
+        if (strcmp(dest, "/") == 0) {
+            if (snprintf(outpath, sizeof(outpath), "/%s", recs[i].path) >= (int)sizeof(outpath))
+                die("path too long for extraction");
+        } else if (strcmp(dest, ".") == 0) {
+            if (snprintf(outpath, sizeof(outpath), "%s", recs[i].path) >= (int)sizeof(outpath))
+                die("path too long for extraction");
+        } else {
+            if (snprintf(outpath, sizeof(outpath), "%s/%s", dest, recs[i].path) >= (int)sizeof(outpath))
+                die("path too long for extraction");
+        }
+
+        ensure_parent_dirs(outpath);
 
         if (recs[i].flags & 0x1) {
+            /* symlink: read target bytes */
             char *buf = malloc(recs[i].size + 1);
             if (!buf) die("malloc");
             if (recs[i].size > 0) {
-                if (fread(buf,1,recs[i].size,in) != recs[i].size) die("read symlink target failed");
+                if (fread(buf, 1, recs[i].size, in) != recs[i].size) die("read symlink target failed");
             }
             buf[recs[i].size] = '\0';
             unlink(outpath);
@@ -379,20 +559,20 @@ static void do_unpack(int argc, char **argv) {
                 die("symlink '%s' -> '%s' failed: %s", outpath, buf, strerror(errno));
             free(buf);
         } else {
+            /* regular file: stream bytes */
             FILE *out = fopen(outpath, "wb");
             if (!out) die("fopen '%s': %s", outpath, strerror(errno));
             uint64_t remaining = recs[i].size;
             char buf[65536];
             while (remaining > 0) {
                 size_t toread = remaining > sizeof(buf) ? sizeof(buf) : (size_t)remaining;
-                if (fread(buf,1,toread,in) != toread) die("read blob failed");
-                if (fwrite(buf,1,toread,out) != toread) die("write out failed");
+                if (fread(buf, 1, toread, in) != toread) die("read blob failed");
+                if (fwrite(buf, 1, toread, out) != toread) die("write out failed");
                 remaining -= toread;
             }
             if (fclose(out) != 0) die("fclose failed for '%s'", outpath);
         }
 
-        /* write relative path to manifest */
         if (fprintf(manifest, "%s\n", recs[i].path) < 0)
             die("write to manifest failed");
 
@@ -402,7 +582,9 @@ static void do_unpack(int argc, char **argv) {
     if (fclose(manifest) != 0)
         die("fclose manifest failed");
 
-    for (uint64_t i = 0; i < entry_count; ++i) free(recs[i].path);
+    for (uint64_t i = 0; i < entry_count; ++i) {
+        if (recs[i].path) free(recs[i].path);
+    }
     free(recs);
     fclose(in);
 }
